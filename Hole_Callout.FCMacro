@@ -1,0 +1,683 @@
+# Hole_Callout.FCMacro
+# Links an existing TechDraw diameter dimension to a Hole/Pocket feature.
+# Registers an observer that auto-updates the callout text when the feature changes.
+# Bindings are saved in the document and restored automatically on document open.
+#
+# Usage:
+#   MODE 1 — Link a new dimension:
+#     1. Create a diameter dimension on a hole edge in TreeCAD
+#     2. Select that dimension AND the Hole/Pocket (use CTRL for multi-select)
+#     3. Run the macro — the dimension updates automatically from now on
+#
+#   MODE 2 — Restore observers after FreeCAD restart:
+#     1. Open your document
+#     2. Run the macro with nothing selected (or click the toolbar button)
+#     3. All previously saved bindings are restored automatically
+#
+#   MODE 3 — Clean up stale bindings (e.g., after deleting dimensions):
+#     Just run the macro — it will automatically remove missing references.
+#
+# Button installation (one-time):
+#   1. Copy this file to your FreeCAD Macro directory
+#   2. Run the macro once — it saves the icon file automatically
+#   3. Tools -> Customize -> Macros -> select Hole_Callout -> fill in details -> Add
+#   4. Tools -> Customize -> Toolbars -> Category: Macros -> drag HoleDimension to a toolbar
+
+__Name__         = "Hole Callout"
+__Author__        = "Grzegorz Ginalski"
+__Version__       = "1.0.0"
+__Date__          = "2026-05-02"
+__Comment__       = "Link a TechDraw diameter dimension to a Hole/Pocket feature with auto-update and auto-cleanup"
+__Wiki__          = ""
+__Icon__          = "Hole_Callout_icon.svg"
+__Help__          = "Select a diameter dimension AND a Hole/Pocket, then run the macro. Run with nothing selected to restore all observers after restart. Stale bindings are removed automatically."
+__Status__        = "stable"
+__Requires__      = "FreeCAD >= 0.21"
+__Communication__ = ""
+__Files__         = "Hole_Callout_icon.svg"
+__License__       = "LGPL-2.0-or-later"
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import os
+import json
+
+# --- Configuration ------------------------------------------------------------
+DIMENSION_PREFIX = "HC_"
+BINDINGS_PROP    = "HoleDimensionBindings"  # document property for saved bindings
+
+# --- SVG Icon -----------------------------------------------------------------
+ICON_SVG = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="6" fill="#2d6fa3"/>
+  <circle cx="32" cy="32" r="12" fill="none" stroke="white" stroke-width="3"/>
+  <line x1="20" y1="32" x2="44" y2="32" stroke="white" stroke-width="2"/>
+  <polygon points="18,28 20,32 18,36" fill="white"/>
+  <polygon points="46,28 44,32 46,36" fill="white"/>
+  <text x="32" y="20" text-anchor="middle" fill="white" font-size="8" font-weight="bold">O</text>
+</svg>"""
+
+# --- Symbols ------------------------------------------------------------------
+SYM_DIAM        = "\u2300"   # diameter
+SYM_DEPTH       = "\u21a7"   # depth arrow
+SYM_COUNTERSINK = "\u2335"   # countersink
+SYM_COUNTERBORE = "\u2334"   # counterbore
+SYM_THRU        = "\u221e"   # through all (infinity)
+
+# --- Counterbore types (ignore countersink angle) -----------------------------
+COUNTERBORE_TYPES = {
+    "Counterbore", "DIN 7984",
+    "ISO 14583", "ISO 14583 (partial)",
+    "ISO 4762", "ISO 4762 + 7089",
+}
+
+# --- Countersink types (angle is meaningful) ----------------------------------
+COUNTERSINK_TYPES = {
+    "Countersink", "Counterdrill",
+    "ISO 10642", "ISO 2009", "ISO 7046",
+}
+
+# --- Thread type sets ---------------------------------------------------------
+THREAD_TYPES_METRIC  = {"ISOMetricProfile", "ISOMetricFineProfile"}
+THREAD_TYPES_PIPE    = {"NPT", "NPTF", "BSP", "BSPP", "BSPT"}
+THREAD_TYPES_UNIFIED = {"UNC", "UNF", "UNEF"}
+THREAD_TYPES_ALL     = THREAD_TYPES_METRIC | THREAD_TYPES_PIPE | THREAD_TYPES_UNIFIED
+
+# --- Formatting helpers -------------------------------------------------------
+
+def to_float(val):
+    """Safely convert a FreeCAD quantity or string to float."""
+    try:
+        return float(val)
+    except Exception:
+        return float(str(val).split()[0])
+
+def fmt_len(val):
+    """Format a length value as '12.5 mm' with trailing zeros stripped."""
+    v = to_float(val)
+    s = f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{s} mm"
+
+def fmt_dia(val):
+    """Format a diameter value as a plain number string."""
+    v = to_float(val)
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+def fmt_angle(val):
+    """Format an angle value as '90 deg'."""
+    v = to_float(val)
+    s = f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{s}\u00b0"
+
+# --- Instance counting --------------------------------------------------------
+
+def count_instances(hole):
+    """Count the number of hole instances from the base sketch geometry."""
+    try:
+        profile    = hole.Profile[0]
+        geometries = profile.Geometry
+    except (AttributeError, IndexError):
+        return 1
+
+    count = 0
+    for geo in geometries:
+        if isinstance(geo, (Part.Point, Part.Circle, Part.ArcOfCircle)):
+            count += 1
+
+    return count if count > 0 else 1
+
+# --- Thread description -------------------------------------------------------
+
+def get_thread_description(hole):
+    """Build a thread callout string if the hole is tapped, else return None."""
+    thread_type = str(getattr(hole, "ThreadType", "") or "").strip()
+    if thread_type not in THREAD_TYPES_ALL:
+        return None
+
+    # Threaded=False means Clearance/Passthrough — no thread class shown
+    is_threaded  = bool(getattr(hole, "Threaded", False))
+    thread_size  = str(getattr(hole, "ThreadSize",  "") or "").strip()
+    thread_class = str(getattr(hole, "ThreadClass", "") or "").strip()
+
+    # Replace empty or placeholder values
+    if thread_size in ("", "---", "None"):
+        dia = to_float(getattr(hole, "ThreadDiameter", 0) or 0)
+        thread_size = f"M{fmt_dia(dia)}" if dia > 0 else "?"
+
+    # Show tolerance class only for tapped holes
+    if not is_threaded or thread_class in ("", "---", "None", "none"):
+        return thread_size
+
+    return f"{thread_size} - {thread_class}"
+
+# --- Hole cut description -----------------------------------------------------
+
+def get_cut_description(hole):
+    """
+    Build callout lines for counterbore / countersink / counterdrill.
+    Uses HoleCutType to determine the geometry type, not the angle value,
+    to avoid stale data from previous settings.
+    """
+    cut_dia   = to_float(getattr(hole, "HoleCutDiameter", 0) or 0)
+    cut_depth = to_float(getattr(hole, "HoleCutDepth",    0) or 0)
+    cs_angle  = to_float(getattr(hole, "HoleCutCountersinkAngle", 0) or 0)
+    cut_type  = str(getattr(hole, "HoleCutType", "None") or "None")
+
+    if cut_dia <= 0 or cut_type == "None":
+        return []
+
+    is_counterdrill = (cut_type == "Counterdrill")
+    is_counterbore  = (
+        cut_type in COUNTERBORE_TYPES
+        or is_counterdrill
+        or (cut_type not in COUNTERSINK_TYPES and cut_depth > 0 and cs_angle >= 90)
+    )
+    is_countersink = cut_type in COUNTERSINK_TYPES or is_counterdrill
+
+    lines = []
+
+    if is_counterbore and cut_depth > 0:
+        lines.append(
+            f"{SYM_COUNTERBORE} {SYM_DIAM}{fmt_dia(cut_dia)} {SYM_DEPTH} {fmt_len(cut_depth)}"
+        )
+
+    if is_countersink:
+        if is_counterdrill:
+            # Counterdrill: cylindrical bore + cone angle only
+            lines.append(f"{SYM_COUNTERSINK} {fmt_angle(cs_angle)}")
+        else:
+            # Pure countersink: diameter x angle
+            lines.append(
+                f"{SYM_COUNTERSINK} {SYM_DIAM}{fmt_dia(cut_dia)} X {fmt_angle(cs_angle)}"
+            )
+
+    return lines
+
+# --- Formatters ---------------------------------------------------------------
+
+def format_hole_text(hole):
+    """Build the full callout string for a PartDesign::Hole feature."""
+    dia        = hole.Diameter
+    depth      = hole.Depth
+    depth_type = str(getattr(hole, "DepthType", "Dimension") or "Dimension")
+    is_thru    = (depth_type == "ThroughAll")
+
+    count     = count_instances(hole)
+    prefix    = f"{count}\u00d7 " if count > 1 else ""
+    depth_str = SYM_THRU if is_thru else fmt_len(depth)
+
+    lines       = []
+    thread_desc = get_thread_description(hole)
+
+    if thread_desc:
+        lines.append(f"{prefix}{thread_desc} {SYM_DEPTH} {depth_str}")
+    else:
+        lines.append(f"{prefix}{SYM_DIAM}{fmt_dia(dia)} {SYM_DEPTH} {depth_str}")
+
+    lines.extend(get_cut_description(hole))
+    return "\n".join(lines)
+
+
+def format_pocket_text(pocket, diameter):
+    """
+    Build the callout string for a PartDesign::Pocket feature.
+    Diameter comes from the TechDraw dimension selected by the user.
+    """
+    pocket_type = str(getattr(pocket, "Type", "") or "")
+    is_thru     = (pocket_type == "ThroughAll")
+    depth       = getattr(pocket, "Length", None) or getattr(pocket, "Depth", None)
+
+    if depth is None and not is_thru:
+        raise ValueError("Cannot read Pocket depth.")
+
+    depth_str = SYM_THRU if is_thru else fmt_len(depth)
+    return f"{SYM_DIAM}{fmt_dia(diameter)} {SYM_DEPTH} {depth_str}"
+
+# --- Read diameter from TechDraw dimension reference -------------------------
+
+def get_diameter_from_dimension(dimension):
+    """
+    Read the current diameter from the dimension's 2D geometry reference.
+    Uses References2D -> getEdgeBySelection -> Curve.Radius, which always
+    reflects the current view geometry (unlike SavedGeometry which may be stale).
+    Falls back to SavedGeometry if References2D is unavailable.
+    """
+    try:
+        view, edges = dimension.References2D[0]
+        edge = view.getEdgeBySelection(edges[0])
+        return edge.Curve.Radius * 2
+    except Exception:
+        pass
+    try:
+        return dimension.SavedGeometry[0].Curve.Radius * 2
+    except Exception:
+        return 0.0
+
+# --- Dispatcher ---------------------------------------------------------------
+
+def get_hole_text(hole, diameter=None):
+    """Return the formatted callout string for a Hole or Pocket feature."""
+    if hole.TypeId == "PartDesign::Hole":
+        return format_hole_text(hole)
+    elif hole.TypeId == "PartDesign::Pocket":
+        if diameter is None:
+            raise ValueError("Pocket requires a diameter value from the TechDraw dimension.")
+        return format_pocket_text(hole, diameter)
+    else:
+        raise ValueError(f"Unsupported object type: {hole.TypeId}")
+
+# --- Dimension style ----------------------------------------------------------
+
+def configure_dimension_style(dimension):
+    """Apply standard style settings to the dimension and its ViewObject."""
+
+    # Data-layer properties
+    for attr, val in [("Inverted", True), ("ShowUnits", False), ("EqualTolerance", True)]:
+        if hasattr(dimension, attr):
+            try:
+                setattr(dimension, attr, val)
+            except Exception:
+                pass
+
+    # ViewObject properties
+    vo = getattr(dimension, "ViewObject", None)
+    if vo is None:
+        return
+
+    if hasattr(vo, "FlipArrowheads"):
+        try:
+            vo.FlipArrowheads = True
+        except Exception:
+            pass
+
+    if hasattr(vo, "StandardAndStyle"):
+        try:
+            vo.StandardAndStyle = "ISO Referencing"
+        except Exception:
+            pass
+
+# --- Bindings persistence (save / load / remove) -----------------------------
+
+def _load_bindings_raw(doc):
+    """Return the list of binding dicts stored in the document property."""
+    try:
+        raw = doc.getPropertyByName(BINDINGS_PROP)
+        return json.loads(raw) if raw else []
+    except Exception:
+        return []
+
+
+def _write_bindings(doc, bindings):
+    """Serialise bindings and write to the document property."""
+    try:
+        if not hasattr(doc, BINDINGS_PROP):
+            doc.addProperty(
+                "App::PropertyString", BINDINGS_PROP, "HoleDimension",
+                "Saved hole-dimension bindings (JSON)", 4
+            )
+        setattr(doc, BINDINGS_PROP, json.dumps(bindings))
+    except Exception as e:
+        App.Console.PrintWarning(f"HoleDimension: could not save bindings: {e}\n")
+
+
+def _save_binding(doc, hole_name, dimension_name):
+    """Add or update a hole<->dimension binding in the document."""
+    bindings = _load_bindings_raw(doc)
+    # Remove existing entry for this pair, then append fresh
+    bindings = [
+        b for b in bindings
+        if not (b.get("hole") == hole_name and b.get("dimension") == dimension_name)
+    ]
+    bindings.append({"hole": hole_name, "dimension": dimension_name})
+    _write_bindings(doc, bindings)
+
+
+def _remove_binding(doc, hole_name, dimension_name):
+    """Remove a binding entry from the document property."""
+    bindings = _load_bindings_raw(doc)
+    bindings = [
+        b for b in bindings
+        if not (b.get("hole") == hole_name and b.get("dimension") == dimension_name)
+    ]
+    _write_bindings(doc, bindings)
+
+# --- Cleanup stale bindings and observers ------------------------------------
+
+def cleanup_stale_bindings(doc):
+    """
+    Remove bindings where the hole or dimension object no longer exists.
+    Also remove dead observers from global registry.
+    Returns number of removed bindings.
+    """
+    bindings = _load_bindings_raw(doc)
+    if not bindings:
+        return 0
+
+    valid = []
+    removed = 0
+    for entry in bindings:
+        hole_name = entry.get("hole")
+        dim_name  = entry.get("dimension")
+        hole_obj  = doc.getObject(hole_name)
+        dim_obj   = doc.getObject(dim_name)
+        if hole_obj and dim_obj:
+            valid.append(entry)
+        else:
+            removed += 1
+            App.Console.PrintMessage(
+                f"HoleDimension: removing stale binding '{hole_name}' <-> '{dim_name}'\n"
+            )
+    if removed:
+        _write_bindings(doc, valid)
+
+    # Clean up global observer registry
+    if hasattr(App, "_hole_dimension_observers"):
+        dead_keys = []
+        for key, obs in App._hole_dimension_observers.items():
+            try:
+                doc_name, dim_name = key
+                doc_obj = App.getDocument(doc_name)
+                if not doc_obj or not doc_obj.getObject(dim_name):
+                    dead_keys.append(key)
+                else:
+                    # Check if dimension still exists in document
+                    if not doc_obj.getObject(dim_name):
+                        dead_keys.append(key)
+            except Exception:
+                dead_keys.append(key)
+        for key in dead_keys:
+            obs = App._hole_dimension_observers.pop(key, None)
+            if obs:
+                try:
+                    App.removeDocumentObserver(obs)
+                except Exception:
+                    pass
+            App.Console.PrintMessage(f"HoleDimension: removed dead observer for {key}\n")
+    return removed
+
+# --- Observer -----------------------------------------------------------------
+
+class HoleDimensionObserver:
+    def __init__(self, hole, dimension, diameter):
+        self.hole_name      = hole.Name
+        self.dimension_name = dimension.Name
+        self.doc_name       = hole.Document.Name
+        self.diameter       = diameter  # cached diameter — avoids SavedGeometry loop
+
+    def slotChangedObject(self, obj, prop):
+        if obj.Name != self.hole_name:
+            return
+        relevant = {
+            "Diameter", "Depth", "DepthType", "Threaded",
+            "ThreadType", "ThreadSize", "ThreadClass", "ThreadFit",
+            "HoleCutType", "HoleCutDiameter", "HoleCutDepth",
+            "HoleCutCountersinkAngle", "Length", "Label",
+        }
+        if prop not in relevant:
+            return
+        self._update()
+
+    def slotRecomputedObject(self, obj):
+        if obj.Name == self.dimension_name:
+            # Dimension recomputed — refresh cached diameter (Pocket may have changed)
+            try:
+                doc       = App.getDocument(self.doc_name)
+                dimension = doc.getObject(self.dimension_name)
+                new_dia   = get_diameter_from_dimension(dimension)
+                if abs(new_dia - self.diameter) > 0.001:
+                    self.diameter = new_dia
+                    self._update()
+            except Exception:
+                pass
+        elif obj.Name == self.hole_name:
+            self._update()
+
+    def _update(self):
+        try:
+            doc       = App.getDocument(self.doc_name)
+            hole      = doc.getObject(self.hole_name)
+            dimension = doc.getObject(self.dimension_name)
+
+            if not hole or not dimension:
+                App.Console.PrintWarning(
+                    "HoleDimension: hole or dimension no longer exists — observer removed.\n"
+                )
+                App.removeDocumentObserver(self)
+                try:
+                    _remove_binding(doc, self.hole_name, self.dimension_name)
+                except Exception:
+                    pass
+                # Also remove from global registry
+                key = (self.doc_name, self.dimension_name)
+                if hasattr(App, "_hole_dimension_observers") and key in App._hole_dimension_observers:
+                    del App._hole_dimension_observers[key]
+                return
+
+            # Keep label in sync
+            expected_label = DIMENSION_PREFIX + hole.Label
+            if dimension.Label != expected_label:
+                dimension.Label = expected_label
+
+            hole_text = get_hole_text(hole, diameter=self.diameter)
+
+            if hasattr(dimension, "Arbitrary") and not dimension.Arbitrary:
+                dimension.Arbitrary = True
+
+            if dimension.FormatSpec != hole_text:
+                dimension.FormatSpec = hole_text
+                doc.recompute()
+                App.Console.PrintMessage(
+                    f"HoleDimension: updated '{expected_label}' -> "
+                    f"{hole_text.replace(chr(10), ' / ')}\n"
+                )
+        except Exception as e:
+            App.Console.PrintError(f"HoleDimension observer error: {e}\n")
+
+# --- Observer registry --------------------------------------------------------
+
+if not hasattr(App, "_hole_dimension_observers"):
+    App._hole_dimension_observers = {}
+
+# --- Register one observer ----------------------------------------------------
+
+def _register_observer(hole, dimension):
+    """Create and register a HoleDimensionObserver for a hole<->dimension pair."""
+    dim_diameter = get_diameter_from_dimension(dimension)
+    key = (hole.Document.Name, dimension.Name)
+
+    old = App._hole_dimension_observers.get(key)
+    if old:
+        try:
+            App.removeDocumentObserver(old)
+        except Exception:
+            pass
+
+    observer = HoleDimensionObserver(hole, dimension, dim_diameter)
+    App.addDocumentObserver(observer)
+    App._hole_dimension_observers[key] = observer
+    observer._update()	
+    return observer
+
+# --- Restore all saved observers ----------------------------------------------
+
+def restore_observers():
+    """
+    Read all saved bindings from the active document and re-register observers.
+    First cleans up stale bindings.
+    """
+    doc = App.ActiveDocument
+    if doc is None:
+        App.Console.PrintError("HoleDimension: no active document.\n")
+        return
+
+    # Clean up stale bindings before restoring
+    cleanup_stale_bindings(doc)
+
+    bindings = _load_bindings_raw(doc)
+    if not bindings:
+        App.Console.PrintMessage(
+            "HoleDimension: no saved bindings found in this document.\n"
+            "  Select a diameter dimension + Hole/Pocket to create a binding.\n"
+        )
+        return
+
+    restored = 0
+    skipped  = 0
+
+    for entry in bindings:
+        hole_name      = entry.get("hole")
+        dimension_name = entry.get("dimension")
+        hole           = doc.getObject(hole_name)
+        dimension      = doc.getObject(dimension_name)
+
+        if not hole or not dimension:
+            # Should have been removed by cleanup, but just in case skip
+            skipped += 1
+            continue
+
+        # Skip if already active this session
+        key = (doc.Name, dimension_name)
+        if key in App._hole_dimension_observers:
+            skipped += 1
+            continue
+
+        _register_observer(hole, dimension)
+        restored += 1
+        App.Console.PrintMessage(
+            f"HoleDimension: restored '{hole.Label}' <-> '{dimension.Label}'\n"
+        )
+
+    App.Console.PrintMessage(
+        f"HoleDimension: restore complete — {restored} restored, {skipped} skipped.\n"
+    )
+
+# --- Link mode ----------------------------------------------------------------
+
+def link_dimension():
+    """Link the selected diameter dimension to the selected Hole/Pocket."""
+    sel = Gui.Selection.getSelection()
+
+    dimension = None
+    hole      = None
+
+    for obj in sel:
+        if obj.TypeId == "TechDraw::DrawViewDimension":
+            dimension = obj
+        elif obj.TypeId in ("PartDesign::Hole", "PartDesign::Pocket"):
+            hole = obj
+
+    if dimension is None:
+        App.Console.PrintError(
+            "HoleDimension: no dimension found in selection.\n"
+            "  Select an existing TechDraw diameter (Ø) dimension.\n"
+        )
+        return
+
+    if getattr(dimension, "Type", None) != "Diameter":
+        App.Console.PrintError(
+            f"HoleDimension: dimension '{dimension.Label}' is type "
+            f"'{getattr(dimension, 'Type', '?')}' — only 'Diameter' is supported.\n"
+            "  Select a diameter (Ø) dimension placed on a hole edge.\n"
+        )
+        return
+
+    if hole is None:
+        App.Console.PrintError(
+            "HoleDimension: no Hole or Pocket found in selection.\n"
+            "  Supported types: PartDesign::Hole, PartDesign::Pocket.\n"
+        )
+        return
+
+    dim_diameter = get_diameter_from_dimension(dimension)
+
+    try:
+        hole_text = get_hole_text(hole, diameter=dim_diameter)
+    except ValueError as e:
+        App.Console.PrintError(f"HoleDimension: {e}\n")
+        return
+
+    # Apply dimension label, style and text
+    dimension.Label = DIMENSION_PREFIX + hole.Label
+    configure_dimension_style(dimension)
+
+    if hasattr(dimension, "Arbitrary"):
+        dimension.Arbitrary = True
+
+    dimension.FormatSpec = hole_text
+    App.ActiveDocument.recompute()
+
+    App.Console.PrintMessage(
+        f"\n[OK] HoleDimension: linked '{dimension.Label}'\n"
+        f"     Text: {hole_text.replace(chr(10), ' / ')}\n"
+    )
+
+    # Register observer and persist binding
+    _register_observer(hole, dimension)
+    _save_binding(App.ActiveDocument, hole.Name, dimension.Name)
+
+    App.Console.PrintMessage(
+        f"HoleDimension: observer active.\n"
+        f"  Binding saved — will be restored automatically on next document open.\n"
+    )
+
+# --- Entry point --------------------------------------------------------------
+
+def run():
+    """
+    Main entry point.
+    If a dimension + hole/pocket are selected  -> link them.
+    Otherwise                                  -> restore all saved observers (with automatic cleanup).
+    """
+    # Always clean up stale bindings first
+    doc = App.ActiveDocument
+    if doc:
+        cleanup_stale_bindings(doc)
+
+    sel         = Gui.Selection.getSelection()
+    has_dim     = any(o.TypeId == "TechDraw::DrawViewDimension" for o in sel)
+    has_hole    = any(o.TypeId in ("PartDesign::Hole", "PartDesign::Pocket") for o in sel)
+
+    if has_dim and has_hole:
+        link_dimension()
+    else:
+        restore_observers()
+
+# --- FreeCAD command ----------------------------------------------------------
+
+class HoleDimensionCommand:
+    def GetResources(self):
+        return {
+            "MenuText": "HoleDimension",
+            "ToolTip": (
+                "Link a TechDraw diameter dimension to a Hole/Pocket feature.\n"
+                "  With dimension + Hole selected: create a new link.\n"
+                "  With nothing selected: restore all observers after FreeCAD restart.\n"
+                "  Stale bindings are removed automatically."
+            ),
+            "Pixmap": ICON_SVG,
+        }
+
+    def IsActive(self):
+        return App.ActiveDocument is not None
+
+    def Activated(self):
+        run()
+
+# --- Save icon and register command -------------------------------------------
+
+_icon_path = os.path.join(App.getUserMacroDir(True), "Hole_Callout_icon.svg")
+if not os.path.exists(_icon_path):
+    try:
+        with open(_icon_path, "w", encoding="utf-8") as _f:
+            _f.write(ICON_SVG)
+    except Exception as _e:
+        App.Console.PrintWarning(f"HoleDimension: could not save icon: {_e}\n")
+
+if not hasattr(Gui, "_hole_dimension_cmd_registered"):
+    Gui.addCommand("HoleDimension", HoleDimensionCommand())
+    Gui._hole_dimension_cmd_registered = True
+
+# --- Run only when executed directly, not when imported -----------------------
+if __name__ == "__main__":
+    run()
