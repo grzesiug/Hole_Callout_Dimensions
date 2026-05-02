@@ -4,6 +4,14 @@ A FreeCAD macro that links a **TechDraw diameter dimension** to a **PartDesign H
 
 ---
 
+## Demo
+
+[![Watch the demo](images/Freecad_techdraw.jpg)](https://youtu.be/EZh8TrF3q68)
+
+▶ **[Watch on YouTube](https://youtu.be/EZh8TrF3q68)** — linking different hole types and live update in action
+
+---
+
 ## Screenshot
 
 ![Hole Callout in action](images/Freecad_techdraw.jpg)
